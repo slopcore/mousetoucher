@@ -64,3 +64,41 @@ class TapDetector {
         return touchStartTime != nil
     }
 }
+
+/// Tracks consecutive taps so synthesized clicks carry a real click count
+/// (2 = double-click / select word, 3 = triple-click / select line or paragraph).
+struct ClickSequence {
+    var interval: TimeInterval
+    var maxDistance: CGFloat
+
+    private(set) var count = 0
+    private var lastTime: TimeInterval = 0
+    private var lastLocation = CGPoint.zero
+
+    init(interval: TimeInterval, maxDistance: CGFloat = 5.0) {
+        self.interval = interval
+        self.maxDistance = maxDistance
+    }
+
+    /// Clicks so far in the sequence if an event at `location`/`time` continues it, else 0.
+    func priorCount(at location: CGPoint, time: TimeInterval) -> Int {
+        guard count > 0,
+              time >= lastTime,
+              time - lastTime <= interval,
+              hypot(location.x - lastLocation.x, location.y - lastLocation.y) <= maxDistance
+        else { return 0 }
+        return count
+    }
+
+    /// Registers a click and returns its click count (1, 2, 3, ...).
+    mutating func register(at location: CGPoint, time: TimeInterval) -> Int {
+        count = priorCount(at: location, time: time) + 1
+        lastTime = time
+        lastLocation = location
+        return count
+    }
+
+    mutating func reset() {
+        count = 0
+    }
+}

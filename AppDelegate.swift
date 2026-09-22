@@ -33,6 +33,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var hasRequestedAccessibilityPrompt = false
     private var hasShownAccessibilityInstructions = false
     private weak var dragLockStatusItem: NSMenuItem?
+    /// Click state stamped on transformed drag events (1 char, 2 word, 3 line selection).
+    private var dragClickState: Int64 = 1
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
@@ -194,8 +196,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         manager.setDragLockAvailable(canTransformDragEvents)
         multitouchManager = manager
 
-        manager.onClickSynthesized = { [weak self] location, isRightClick in
-            self?.synthesizeClick(at: location, isRightClick: isRightClick)
+        manager.onClickSynthesized = { [weak self] location, isRightClick, clickCount in
+            self?.synthesizeClick(at: location, isRightClick: isRightClick, clickCount: clickCount)
+        }
+        manager.onHoldDragChanged = { [weak self] location, isDown, clickState in
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if isDown {
+                    guard self.isOnActiveDisplay(location) else { return }
+                    self.dragClickState = Int64(clickState)
+                    self.setDragEventTapEnabled(true)
+                    self.postButton(.leftMouseDown, at: location, clickState: clickState)
+                } else {
+                    // Always release, never leave the button stuck down.
+                    self.postButton(.leftMouseUp, at: location, clickState: clickState)
+                    if self.multitouchManager?.isDragLocked != true {
+                        self.setDragEventTapEnabled(false)
+                    }
+                    self.dragClickState = 1
+                }
+            }
         }
         manager.onDragLockChanged = { [weak self] location, isLocked in
             guard let self = self else { return }
@@ -206,6 +226,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Enable the transformer before mouse-down, and disable it only after mouse-up.
                 // It is therefore absent from the normal one-finger click path.
                 if isLocked {
+                    self.dragClickState = 1
                     self.setDragEventTapEnabled(true)
                     self.synthesizeDragLock(at: location, isLocked: true)
                 } else {
@@ -266,7 +287,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     fileprivate func handleDragEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if multitouchManager?.isDragLocked == true {
+            if multitouchManager?.isDragLocked == true || multitouchManager?.isHoldDragging == true {
                 setDragEventTapEnabled(true)
             }
             return Unmanaged.passUnretained(event)
@@ -281,7 +302,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .mouseEventButtonNumber,
             value: Int64(CGMouseButton.left.rawValue)
         )
-        event.setIntegerValueField(.mouseEventClickState, value: 1)
+        event.setIntegerValueField(.mouseEventClickState, value: dragClickState)
         event.setDoubleValueField(.mouseEventPressure, value: 1.0)
         return Unmanaged.passUnretained(event)
     }
@@ -321,24 +342,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return matchingDisplayCount > 0
     }
 
-    func synthesizeClick(at location: CGPoint, isRightClick: Bool) {
+    func synthesizeClick(at location: CGPoint, isRightClick: Bool, clickCount: Int = 1) {
         guard isOnActiveDisplay(location) else { return }
 
-        if isRightClick {
-            if let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: location, mouseButton: .right) {
-                mouseDown.post(tap: .cghidEventTap)
-            }
-            if let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: location, mouseButton: .right) {
-                mouseUp.post(tap: .cghidEventTap)
-            }
-        } else {
-            if let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: location, mouseButton: .left) {
-                mouseDown.post(tap: .cghidEventTap)
-            }
-            if let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: location, mouseButton: .left) {
-                mouseUp.post(tap: .cghidEventTap)
+        // clickState is what apps read as NSEvent.clickCount: 2 selects a word, 3 a line/paragraph.
+        // Synthetic events don't get it computed for them, so it must be stamped explicitly.
+        let button: CGMouseButton = isRightClick ? .right : .left
+        let downType: CGEventType = isRightClick ? .rightMouseDown : .leftMouseDown
+        let upType: CGEventType = isRightClick ? .rightMouseUp : .leftMouseUp
+        let flags = currentModifierFlags()
+
+        for type in [downType, upType] {
+            if let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: location, mouseButton: button) {
+                event.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
+                event.flags = flags   // Shift-tap extends selection, Cmd-tap opens in new tab, etc.
+                event.post(tap: .cghidEventTap)
             }
         }
+    }
+
+    /// Press/release for tap-then-hold selection. Uses the drag-lock event source so physical
+    /// mouse movement is not suppressed while the synthetic button is held.
+    private func postButton(_ type: CGEventType, at location: CGPoint, clickState: Int) {
+        if let event = CGEvent(mouseEventSource: dragEventSource, mouseType: type, mouseCursorPosition: location, mouseButton: .left) {
+            event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
+            event.flags = currentModifierFlags()
+            event.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func currentModifierFlags() -> CGEventFlags {
+        CGEventSource.flagsState(.combinedSessionState)
+            .intersection([.maskShift, .maskControl, .maskAlternate, .maskCommand])
     }
 
     /// Holds or releases the primary mouse button. Pointer movement produced by the physical

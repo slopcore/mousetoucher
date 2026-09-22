@@ -13,6 +13,10 @@ class MultitouchManager {
     private var touchStartX: Float = 0.0
     private var touchStartY: Float = 0.0
     private var surfaceMovementThreshold: Float = 0.15  // Max finger movement on surface (0-1 scale)
+    private var clickSequence = ClickSequence(interval: NSEvent.doubleClickInterval)
+    private var holdPending = false          // touch landed right after a tap; may become a drag
+    private var holdClickState = 1
+    private var holdStartLocation = CGPoint.zero
 
     /// Taps with a normalized x above this are right clicks. Configurable from the menu bar.
     var rightClickThreshold: Float = Preferences.rightClickThreshold {
@@ -23,9 +27,12 @@ class MultitouchManager {
 
     fileprivate static var sharedInstance: MultitouchManager?
 
-    var onClickSynthesized: ((CGPoint, Bool) -> Void)?
+    var onClickSynthesized: ((CGPoint, Bool, Int) -> Void)?   // location, isRightClick, clickCount
     var onDragLockChanged: ((CGPoint, Bool) -> Void)?
+    /// Tap-then-hold selection drag: location, isDown, clickState (1 char, 2 word, 3 line).
+    var onHoldDragChanged: ((CGPoint, Bool, Int) -> Void)?
     private(set) var isDragLocked = false
+    private(set) var isHoldDragging = false
 
     init() {
         MultitouchManager.sharedInstance = self
@@ -122,11 +129,18 @@ class MultitouchManager {
         }
 
         if numTouches == 0 {
+            if isHoldDragging {
+                // Finger lifted: finish the tap-then-hold selection.
+                cancelSingleTouchTracking()
+                clickSequence.reset()
+                return
+            }
             if activeTouch != -1 {
                 // Get cursor position directly from CGEvent (already in correct coordinate space)
                 let cgLocation = CGEvent(source: nil)?.location ?? CGPoint.zero
 
                 if isDragLocked {
+                    clickSequence.reset()
                     // Fallback release: a clean one-finger tap releases an active drag lock without
                     // producing another click. Moving the mouse or resting a finger while dragging
                     // is not a tap and will not release the lock.
@@ -135,8 +149,17 @@ class MultitouchManager {
                     }
                 } else if let tapLocation = tapDetector.touchEnded(at: cgLocation) {
                     let isRightClick = touchStartX > rightClickThreshold
-                    onClickSynthesized?(tapLocation, isRightClick)
+                    let clickCount: Int
+                    if isRightClick {
+                        clickSequence.reset()
+                        clickCount = 1
+                    } else {
+                        clickCount = clickSequence.register(
+                            at: tapLocation, time: ProcessInfo.processInfo.systemUptime)
+                    }
+                    onClickSynthesized?(tapLocation, isRightClick, clickCount)
                 }
+                holdPending = false
                 activeTouch = -1
                 touchStartX = 0.0
                 touchStartY = 0.0
@@ -156,6 +179,18 @@ class MultitouchManager {
                     touchStartX = touch.normalized.position.x
                     touchStartY = touch.normalized.position.y
                     tapDetector.touchBegan(at: cgLocation)
+
+                    // Touch landing just after a left tap, near it: arm tap-then-hold selection.
+                    let prior = clickSequence.priorCount(
+                        at: cgLocation, time: ProcessInfo.processInfo.systemUptime)
+                    if prior > 0 && isDragLockAvailable && !isDragLocked {
+                        holdPending = true
+                        holdClickState = min(prior, 3)
+                        holdStartLocation = cgLocation
+                    }
+                } else if isHoldDragging {
+                    // Selecting: physical mouse movement becomes drag via the event tap.
+                    // Ignore finger drift on the surface until lift.
                 } else if activeTouch == touch.identifier {
                     // Same touch continuing - check if finger moved too much on surface (scrolling)
                     let deltaX = abs(touch.normalized.position.x - touchStartX)
@@ -165,13 +200,19 @@ class MultitouchManager {
                     if surfaceMovement > surfaceMovementThreshold {
                         // Finger moved too much on surface - likely scrolling, cancel tap
                         tapDetector.reset()
+                        holdPending = false
                         activeTouch = -1
                         touchStartX = 0.0
                         touchStartY = 0.0
                     } else {
                         // Check cursor movement too (physical mouse movement cancels tap)
                         let moved = tapDetector.touchMoved(to: cgLocation)
-                        if moved {
+                        if moved && holdPending {
+                            // Tap, then touch-and-move the mouse: press at the anchor and drag.
+                            holdPending = false
+                            isHoldDragging = true
+                            onHoldDragChanged?(holdStartLocation, true, holdClickState)
+                        } else if moved {
                             activeTouch = -1
                             touchStartX = 0.0
                             touchStartY = 0.0
@@ -202,7 +243,16 @@ class MultitouchManager {
         cancelSingleTouchTracking()
     }
 
+    private func endHoldDrag() {
+        holdPending = false
+        guard isHoldDragging else { return }
+        isHoldDragging = false
+        let location = CGEvent(source: nil)?.location ?? CGPoint.zero
+        onHoldDragChanged?(location, false, holdClickState)
+    }
+
     private func cancelSingleTouchTracking() {
+        endHoldDrag()
         tapDetector.reset()
         activeTouch = -1
         touchStartX = 0.0
